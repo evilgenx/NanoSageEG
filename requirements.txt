@@ -1,17 +1,12 @@
-# Core Dependencies
-torch
+PyYAML
+ollama
 transformers
 sentence-transformers
+torch
 numpy
-pyyaml
-
-# Web and Parsing
+PyMuPDF
+Pillow
 aiohttp
-duckduckgo_search
 beautifulsoup4
-pymupdf  # PyMuPDF for PDF handling
-pytesseract
-Pillow   # for image handling
-
-# Optional LLM Integration
-ollama
+duckduckgo-search
+# Optional: pytesseract (requires system Tesseract installation)
