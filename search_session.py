@@ -7,16 +7,26 @@ import time
 import re
 import random
 import yaml
+import sys # Added for stderr
+
+# Attempt to import google.generativeai, handle if not installed yet
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    genai = None # Define genai as None if import fails
 
 from knowledge_base import KnowledgeBase, late_interaction_score, load_corpus_from_dir, load_retrieval_model, embed_text
 from web_search import download_webpages_ddg, parse_html_to_text, group_web_results_by_domain, sanitize_filename
 from aggregator import aggregate_results
 
 #############################################
-# LLM (Gemma) & Summarization / RAG utilities
+# LLM & Summarization / RAG utilities
 #############################################
 
-from ollama import chat, ChatResponse
+# --- Ollama (Gemma) ---
+from ollama import chat as ollama_chat, ChatResponse as OllamaChatResponse
 
 def call_gemma(prompt, model="gemma2:2b", personality=None):
     system_message = ""
@@ -26,9 +36,56 @@ def call_gemma(prompt, model="gemma2:2b", personality=None):
     if system_message:
         messages.append({"role": "system", "content": system_message})
     messages.append({"role": "user", "content": prompt})
-    response: ChatResponse = chat(model=model, messages=messages)
-    return response.message.content
+    try:
+        response: OllamaChatResponse = ollama_chat(model=model, messages=messages)
+        return response.message.content
+    except Exception as e:
+        print(f"[ERROR] Ollama call failed for model {model}: {e}", file=sys.stderr)
+        return f"Error: Could not get response from Ollama model {model}."
 
+# --- Gemini ---
+def call_gemini(prompt, model_name, api_key, personality=None):
+    """Calls the Gemini API."""
+    if not GEMINI_AVAILABLE:
+        return "Error: google-generativeai library not installed."
+    if not api_key:
+        return "Error: Gemini API key not provided in config."
+
+    try:
+        genai.configure(api_key=api_key)
+        # Model name expected format from main.py is 'gemini/models/model-name'
+        # Extract the actual model name for the API call
+        actual_model_name = model_name.split('/')[-1]
+        model = genai.GenerativeModel(actual_model_name)
+
+        # Construct messages (similar structure to Ollama)
+        # Note: Gemini API might have slightly different role names or structure requirements.
+        # Adjust if needed based on google-generativeai documentation.
+        # For basic text generation, sending the prompt directly might suffice.
+        # Adding personality as a system instruction if provided.
+        full_prompt = prompt
+        if personality:
+             # Gemini doesn't have a direct 'system' role like Ollama in the basic generate_content.
+             # Prepending the personality instruction to the user prompt.
+             full_prompt = f"System Instruction: You are a {personality} assistant.\n\nUser Prompt:\n{prompt}"
+
+        print(f"[INFO] Calling Gemini model: {actual_model_name}")
+        response = model.generate_content(full_prompt)
+        # Handle potential safety blocks or empty responses
+        if not response.parts:
+             print("[WARN] Gemini response was empty or blocked.", file=sys.stderr)
+             # Check for safety ratings if available
+             safety_info = response.prompt_feedback if hasattr(response, 'prompt_feedback') else "No safety feedback."
+             print(f"[DEBUG] Safety Feedback: {safety_info}", file=sys.stderr)
+             return "Error: Gemini response was empty or blocked due to safety settings."
+        return response.text
+    except Exception as e:
+        print(f"[ERROR] Gemini API call failed for model {model_name}: {e}", file=sys.stderr)
+        # You might want to check for specific API errors here (e.g., invalid key, quota exceeded)
+        return f"Error: Gemini API call failed for model {model_name}."
+
+
+# --- Common Utilities ---
 def extract_final_query(text):
     marker = "Final Enhanced Query:"
     if marker in text:
@@ -64,17 +121,28 @@ def summarize_text(text, max_chars=6000, personality=None):
         combined = call_gemma(prompt, personality=personality)
     return combined
 
-def rag_final_answer(aggregation_prompt, rag_model="gemma", personality=None):
-    print("[INFO] Performing final RAG generation using model:", rag_model)
-    if rag_model == "gemma":
-        return call_gemma(aggregation_prompt, personality=personality)
+def rag_final_answer(aggregation_prompt, rag_model="gemma", personality=None, gemini_api_key=None):
+    """Generates the final RAG answer using the specified model."""
+    print(f"[INFO] Performing final RAG generation using model: {rag_model}")
+
+    if rag_model.startswith("gemini/"):
+        # Use Gemini
+        return call_gemini(aggregation_prompt, model_name=rag_model, api_key=gemini_api_key, personality=personality)
     elif rag_model == "pali":
+        # Use Ollama (Gemma) with PALI modification
         modified_prompt = f"PALI mode analysis:\n\n{aggregation_prompt}"
+        # Assuming 'pali' implies using the default gemma model via ollama
         return call_gemma(modified_prompt, personality=personality)
     else:
-        return call_gemma(aggregation_prompt, personality=personality)
+        # Default to Ollama (Gemma) or specified Ollama model
+        # If rag_model is just 'gemma', call_gemma uses its default.
+        # If rag_model is something else (e.g., 'gemma:7b'), pass it to call_gemma.
+        ollama_model = rag_model if rag_model != "gemma" else "gemma2:2b" # Use default if just 'gemma'
+        return call_gemma(aggregation_prompt, model=ollama_model, personality=personality)
+
 
 def follow_up_conversation(follow_up_prompt, personality=None):
+    # This currently only uses Gemma. Could be extended to use Gemini if needed.
     return call_gemma(follow_up_prompt, personality=personality)
 
 def clean_search_query(query):
@@ -142,14 +210,17 @@ def build_toc_string(toc_nodes, indent=0):
 #########################################################
 
 class SearchSession:
-    def __init__(self, query, config, corpus_dir=None, device="cpu",
+    def __init__(self, query, config, gemini_api_key=None, corpus_dir=None, device="cpu",
                  retrieval_model="colpali", top_k=3, web_search_enabled=False,
                  personality=None, rag_model="gemma", max_depth=1):
         """
+        Initializes the search session.
+        :param gemini_api_key: API key for Google Gemini, if available.
         :param max_depth: Maximum recursion depth for subquery expansion.
         """
         self.query = query
         self.config = config
+        self.gemini_api_key = gemini_api_key # Store the key
         self.corpus_dir = corpus_dir
         self.device = device
         self.retrieval_model = retrieval_model
@@ -197,6 +268,7 @@ class SearchSession:
         self.grouped_web_results = {}
         self.local_results = []
         self.toc_tree = []  # List of TOCNode objects for the initial subqueries
+        self._reference_links = [] # Initialize reference links
 
     async def run_session(self):
         """
@@ -234,7 +306,8 @@ class SearchSession:
         summarized_web = self._summarize_web_results(self.web_results)
         summarized_local = self._summarize_local_results(self.local_results)
         final_answer = self._build_final_answer(summarized_web, summarized_local)
-        print("[INFO] Finished building final advanced report.")
+        # Final answer generation now happens within _build_final_answer
+        print("[INFO] Finished session run.")
         return final_answer
 
     def perform_monte_carlo_subqueries(self, parent_query, subqueries):
@@ -377,10 +450,13 @@ class SearchSession:
             reference_urls.append(url)
         text = "\n".join(lines)
         # We'll store reference URLs in self._reference_links for final prompt
-        self._reference_links = list(set(reference_urls))  # unique
+        self._reference_links.extend(reference_urls) # Add to existing list
+        self._reference_links = sorted(list(set(self._reference_links))) # Keep unique and sort
+        # TODO: Decide if summarization should also use Gemini if selected? For now, uses Gemma.
         return summarize_text(text, personality=self.personality)
 
     def _summarize_local_results(self, local_results):
+        # TODO: Decide if summarization should also use Gemini if selected? For now, uses Gemma.
         lines = []
         for doc in local_results:
             meta = doc.get('metadata', {})
@@ -427,7 +503,13 @@ Write the report in clear Markdown with section headings, subheadings, and refer
 Report:
 """
         print("[DEBUG] Final RAG prompt constructed. Passing to rag_final_answer()...")
-        final_answer = rag_final_answer(aggregation_prompt, rag_model=self.rag_model, personality=self.personality)
+        # Pass the Gemini API key to the final RAG step
+        final_answer = rag_final_answer(
+            aggregation_prompt,
+            rag_model=self.rag_model,
+            personality=self.personality,
+            gemini_api_key=self.gemini_api_key # Pass the key here
+        )
         return final_answer
 
     def save_report(self, final_answer, previous_results=None, follow_up_convo=None):

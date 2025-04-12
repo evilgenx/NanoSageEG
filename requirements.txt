@@ -9,4 +9,5 @@ Pillow
 aiohttp
 beautifulsoup4
 duckduckgo-search
+google-generativeai>=0.4.0 # Added for Gemini support
 # Optional: pytesseract (requires system Tesseract installation)
